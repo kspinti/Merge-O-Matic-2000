@@ -113,6 +113,27 @@ if uploaded_files:
             "cleanup": {}
         }
 
+        # --- 🔍 Check for duplicate timestamps in preview ---
+        datetime_cols = [
+            c for c in df_preview.columns
+            if "date" in c.lower() or "time" in c.lower()
+        ]
+
+        dupe_choice = "Average values"  # default
+        if datetime_cols:
+            try:
+                dt_col = datetime_cols[0]
+                temp_dt = pd.to_datetime(df_preview[dt_col], errors="coerce")
+                if temp_dt.duplicated().any():
+                    with st.expander(f"⚠️ Duplicate timestamps detected in {file.name}"):
+                        dupe_choice = st.radio(
+                            f"How should duplicates be handled in {file.name}?",
+                            ["Average values", "Maximum value", "Minimum value"],
+                            key=f"dupes_{file.name}"
+                        )
+            except Exception:
+                pass
+        file_data[file.name]["dupe_handling"] = dupe_choice
 
     st.success(f"✅ Uploaded {len(uploaded_files)} files!")
 
@@ -363,7 +384,14 @@ if file_data:
                 st.write(f"✅ {file_name}: {cleaned_rows} missing values cleaned up.")
 
             if df.index.has_duplicates:
-                df = df.groupby(df.index).mean(numeric_only=True)
+                choice = meta.get("dupe_handling", "Average values")
+
+                if choice == "Average values":
+                    df = df.groupby(df.index).mean(numeric_only=True)
+                elif choice == "Maximum value":
+                    df = df.groupby(df.index).max(numeric_only=True)
+                elif choice == "Minimum value":
+                    df = df.groupby(df.index).min(numeric_only=True)
 
             # --- Alignment + insert into combined ---
             for col in meta["selected_cols"]:
