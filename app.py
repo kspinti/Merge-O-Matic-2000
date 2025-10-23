@@ -172,7 +172,8 @@ if file_data:
                         cleanup_choice = st.selectbox(
                             "Missing data handling method",
                             [
-                                "Fill with nearest available value",
+                                "Fill using last valid entry",
+                                "Fill using next available value",
                                 "Fill with a linear interpolation between the nearest values",
                                 "Delete the entire row of data",
                                 "Fill with zero"
@@ -341,8 +342,10 @@ if file_data:
                 # Count missing values before cleanup
                 missing_before = df[col].isna().sum()
 
-                if method == "Fill with nearest available value":
-                    df[col] = pd.to_numeric(df[col], errors="coerce").ffill().bfill()
+                if method == "Fill using last valid entry":
+                    df[col] = pd.to_numeric(df[col], errors="coerce").ffill()
+                elif method == "Fill using next available value":
+                    df[col] = pd.to_numeric(df[col], errors="coerce").bfill()
                 elif method == "Fill with a linear interpolation between the nearest values":
                     df[col] = pd.to_numeric(df[col], errors="coerce").interpolate(method="time")
                 elif method == "Delete the entire row of data":
