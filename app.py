@@ -256,7 +256,14 @@ if file_data:
                     if df_full.index.has_duplicates:
                         df_full = df_full.groupby(df_full.index).mean(numeric_only=True)
 
-                    y = pd.to_numeric(df_full[col], errors="coerce")
+                    # Try to locate matching column safely
+                    matched_col = next((c for c in df_full.columns if c.strip().lower() == col.strip().lower()), None)
+
+                    if matched_col is None:
+                        st.warning(f"⚠️ Column '{col}' not found in {file_name}. Skipping.")
+                        continue
+
+                    y = pd.to_numeric(df_full[matched_col], errors="coerce")
                     combined_plot_df[label] = y
 
                     progress.progress(i / len(available_columns), text=f"Loaded {i} of {len(available_columns)} columns")
