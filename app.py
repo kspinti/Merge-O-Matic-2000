@@ -233,6 +233,7 @@ if file_data:
                 progress = st.progress(0, text="Loading selected data for plotting...")
 
                 for i, (file_name, col, title, label) in enumerate(available_columns, start=1):
+
                     if label not in selected_labels:
                         continue
 
@@ -253,17 +254,17 @@ if file_data:
 
                     # --- Clean & sort ---
                     df_full = df_full.sort_index()
-                    if df_full.index.has_duplicates:
-                        df_full = df_full.groupby(df_full.index).mean(numeric_only=True)
 
-                    # Try to locate matching column safely
-                    matched_col = next((c for c in df_full.columns if c.strip().lower() == col.strip().lower()), None)
+                    choice = meta.get("dupe_handling", "Average values")
+                    if choice == "Average values":
+                        df_full = df_full.groupby(df_full.index).agg(lambda x: x.mean() if pd.api.types.is_numeric_dtype(x) else x.iloc[0])
+                    elif choice == "Maximum value":
+                        df_full = df_full.groupby(df_full.index).agg(lambda x: x.max() if pd.api.types.is_numeric_dtype(x) else x.iloc[0])
+                    elif choice == "Minimum value":
+                        df_full = df_full.groupby(df_full.index).agg(lambda x: x.min() if pd.api.types.is_numeric_dtype(x) else x.iloc[0])
 
-                    if matched_col is None:
-                        st.warning(f"⚠️ Column '{col}' not found in {file_name}. Skipping.")
-                        continue
 
-                    y = pd.to_numeric(df_full[matched_col], errors="coerce")
+                    y = pd.to_numeric(df_full[col], errors="coerce")
                     combined_plot_df[label] = y
 
                     progress.progress(i / len(available_columns), text=f"Loaded {i} of {len(available_columns)} columns")
