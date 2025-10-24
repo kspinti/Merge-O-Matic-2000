@@ -59,9 +59,9 @@ def read_flexible_csv(file_bytes, max_check_lines=30):
 
     # Try reading the CSV with the detected header row
     try:
-        df = pd.read_csv(io.BytesIO(file_bytes), header=header_row)
+        df = pd.read_csv(io.BytesIO(file_bytes), header=header_row, low_memory=False)
     except Exception:
-        df = pd.read_csv(io.BytesIO(file_bytes), header=0)
+        df = pd.read_csv(io.BytesIO(file_bytes), header=0, low_memory=False)
 
     return df, header_row
 
@@ -134,6 +134,14 @@ if uploaded_files:
             except Exception:
                 pass
         file_data[file.name]["dupe_handling"] = dupe_choice
+
+        
+        # Get earliest timestamp from preview and add to start_dates
+        if datetime_cols:
+            earliest = pd.to_datetime(df_preview[datetime_cols[0]], errors="coerce").min()
+            if pd.notnull(earliest):
+                start_dates.append(earliest)
+
 
     st.success(f"✅ Uploaded {len(uploaded_files)} files!")
 
@@ -294,6 +302,7 @@ if file_data:
 # --- Step 3: Time & Interval ---
 if file_data:
     st.header("🕔 Time Range & Interval")
+    st.write("Select the times range and interval for your combined data set.")
     if start_dates:
         default_first = (max(start_dates) + pd.Timedelta(days=1))
     else:
