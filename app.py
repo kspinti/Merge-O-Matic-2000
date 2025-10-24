@@ -211,58 +211,58 @@ if file_data:
                         )
                         meta["cleanup"][col] = cleanup_choice
 
+if "graph_fig" not in st.session_state:
+    st.session_state.graph_fig = None
 
 # --- Step 2.5: Combined Graphing Section ---
 if file_data:
     st.header("📊 Visualize Combined Data (Optional)")
 
-    if st.checkbox("Load all datasets for graphing (may take time)", value=False):
+    # Button to trigger graph generation
+    if st.button("Generate Graph"):
         # Gather all possible columns from all files
         available_columns = []
         for file_name, meta in file_data.items():
             for col, title in meta["selected_cols"].items():
-                label = f"{file_name} - {title}"
+                label = f"{title}"
                 available_columns.append((file_name, col, title, label))
 
         if not available_columns:
             st.info("No selected columns available yet. Choose some in the previous step.")
         else:
-            # Let user pick which ones to include on the graph
             graph_labels = [item[3] for item in available_columns]
             selected_labels = st.multiselect(
                 "Select columns to display on the combined graph:",
                 options=graph_labels,
-                default=graph_labels[:min(3, len(graph_labels))]  # preselect a few
+                default=graph_labels
             )
 
             if selected_labels:
                 combined_plot_df = pd.DataFrame()
-
                 progress = st.progress(0, text="Loading selected data for plotting...")
 
                 for i, (file_name, col, title, label) in enumerate(available_columns, start=1):
-
                     if label not in selected_labels:
                         continue
 
-                    # --- Load file data only if needed ---
+                    # Load file data
                     if file_name.lower().endswith(".csv"):
                         df_full, header_row = read_flexible_csv(file_data[file_name]["raw_file"])
-
                     else:
                         df_full = pd.read_excel(io.BytesIO(file_data[file_name]["raw_file"]))
 
-                    # --- Detect datetime ---
-                    datetime_cols = [c for c in df_full.columns if pd.api.types.is_datetime64_any_dtype(df_full[c]) or "date" in c.lower() or "time" in c.lower()]
+                    # Normalize columns
+                    df_full.columns = df_full.columns.str.strip().str.lower()
+
+                    # Detect datetime
+                    datetime_cols = [c for c in df_full.columns if "date" in c.lower() or "time" in c.lower()]
                     if datetime_cols:
-                        df_full[datetime_cols[0]] = pd.to_datetime(df_full[datetime_cols[0]], errors="coerce")
+                        df_full[datetime_cols[0]] = pd.to_datetime(df_full[datetime_cols[0]], format="%m/%d/%y %I:%M %p", errors="coerce")
                         df_full = df_full.set_index(datetime_cols[0])
                     else:
                         df_full.index = pd.to_datetime(df_full.index, errors="coerce")
 
-                    # --- Clean & sort ---
                     df_full = df_full.sort_index()
-
                     choice = meta.get("dupe_handling", "Average values")
                     if choice == "Average values":
                         df_full = df_full.groupby(df_full.index).agg(lambda x: x.mean() if pd.api.types.is_numeric_dtype(x) else x.iloc[0])
@@ -271,17 +271,18 @@ if file_data:
                     elif choice == "Minimum value":
                         df_full = df_full.groupby(df_full.index).agg(lambda x: x.min() if pd.api.types.is_numeric_dtype(x) else x.iloc[0])
 
+                    matched_col = next((c for c in df_full.columns if c.strip().lower() == col.strip().lower()), None)
+                    if matched_col is None or df_full[matched_col].dropna().empty:
+                        continue
 
-                    y = pd.to_numeric(df_full[col], errors="coerce")
+                    y = pd.to_numeric(df_full[matched_col], errors="coerce")
                     combined_plot_df[label] = y
 
                     progress.progress(i / len(available_columns), text=f"Loaded {i} of {len(available_columns)} columns")
 
                 progress.progress(1.0, text="✅ Data ready for plotting")
 
-                # --- Combine all into one chart ---
                 combined_plot_df = combined_plot_df.sort_index()
-
                 fig = px.line(
                     combined_plot_df,
                     x=combined_plot_df.index,
@@ -289,15 +290,14 @@ if file_data:
                     title="Combined Data Plot (All Files)",
                     labels={"x": "Date/Time", "value": "Value", "variable": "Column"},
                 )
-                fig.update_layout(
-                    height=600,
-                    xaxis_title="Date/Time",
-                    yaxis_title="Value",
-                    hovermode="x unified",
-                    legend=dict(orientation="h", y=-0.25),
-                )
+                fig.update_layout(height=600, hovermode="x unified", legend=dict(orientation="h", y=-0.25))
 
-                st.plotly_chart(fig, config={"responsive": True, "displaylogo": False})
+                # Save figure in session state
+                st.session_state.graph_fig = fig
+
+    # Display graph if it exists
+    if st.session_state.graph_fig:
+        st.plotly_chart(st.session_state.graph_fig, config={"responsive": True, "displaylogo": False})
 
 # --- Step 3: Time & Interval ---
 if file_data:
