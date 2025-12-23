@@ -10,9 +10,10 @@ from pathlib import Path
 
 # --- Cached file reading for performance ---
 @st.cache_data
-def load_file(file_bytes: bytes, file_name: str) -> tuple[pd.DataFrame, int]:
+def load_file(file_bytes: bytes, file_name: str, is_stacked: bool = False) -> tuple[pd.DataFrame, int]:
     """Load CSV or Excel file with caching to avoid redundant reads."""
-    if file_name.lower().endswith(".csv"):
+    # Stacked datasets are always stored as CSV
+    if is_stacked or file_name.lower().endswith(".csv"):
         return read_flexible_csv(file_bytes)
     else:
         return pd.read_excel(io.BytesIO(file_bytes)), 0
@@ -23,6 +24,11 @@ def read_flexible_csv(file_bytes: bytes, max_check_lines: int = 30) -> tuple[pd.
     Automatically detects which line contains the column headers.
     """
     text = file_bytes.decode(errors="ignore").splitlines()
+    
+    # If empty file, return empty dataframe
+    if not text:
+        return pd.DataFrame(), 0
+    
     sample_lines = text[:max_check_lines]
 
     header_row = 0
@@ -31,13 +37,15 @@ def read_flexible_csv(file_bytes: bytes, max_check_lines: int = 30) -> tuple[pd.
         if len(parts) < 2:
             continue
 
-        non_numeric = sum(1 for p in parts if not p.replace(".", "").replace("-", "").isdigit())
+        non_numeric = sum(1 for p in parts if not p.replace(".", "").replace("-", "").replace(":", "").replace("/", "").isdigit())
         if non_numeric / len(parts) >= 0.5:
             header_row = i
             break
 
     try:
         df = pd.read_csv(io.BytesIO(file_bytes), header=header_row, low_memory=False)
+        # Remove any completely empty rows at the start
+        df = df.dropna(how='all').reset_index(drop=True)
     except Exception:
         df = pd.read_csv(io.BytesIO(file_bytes), header=0, low_memory=False)
 
@@ -104,6 +112,140 @@ def is_string_column(series: pd.Series) -> bool:
     
     return False
 
+def check_stack_compatibility(file_data: dict, file_names: list[str]) -> dict:
+    """
+    Check if files are compatible for stacking.
+    Returns dict with 'compatible' bool, 'warnings' list, and 'common_columns' list.
+    """
+    if len(file_names) < 2:
+        return {"compatible": True, "warnings": [], "common_columns": []}
+    
+    # Load all files and get their columns
+    all_columns = []
+    all_dfs = []
+    
+    for fn in file_names:
+        df, _ = load_file(file_data[fn]["raw_bytes"], fn)
+        selectable = get_selectable_columns(df)
+        all_columns.append(set(selectable))
+        all_dfs.append((fn, df))
+    
+    # Find common columns
+    common = all_columns[0]
+    for cols in all_columns[1:]:
+        common = common.intersection(cols)
+    
+    warnings = []
+    
+    # Check for column mismatches
+    all_cols_union = set()
+    for cols in all_columns:
+        all_cols_union = all_cols_union.union(cols)
+    
+    missing_cols = all_cols_union - common
+    if missing_cols:
+        warnings.append(f"⚠️ Column mismatch: The following columns are not present in all files and will be excluded: {', '.join(sorted(missing_cols))}")
+    
+    # Check for overlapping timestamps
+    time_ranges = []
+    for fn, df in all_dfs:
+        dt_col = detect_datetime_column(df)
+        if dt_col:
+            times = pd.to_datetime(df[dt_col], errors='coerce').dropna()
+            if len(times) > 0:
+                time_ranges.append((fn, times.min(), times.max()))
+    
+    # Check for overlaps between any pair of files
+    overlaps = []
+    for i, (fn1, start1, end1) in enumerate(time_ranges):
+        for fn2, start2, end2 in time_ranges[i+1:]:
+            # Check if ranges overlap
+            if start1 <= end2 and start2 <= end1:
+                overlap_start = max(start1, start2)
+                overlap_end = min(end1, end2)
+                overlaps.append(f"{fn1} and {fn2} ({overlap_start.strftime('%Y-%m-%d %H:%M')} to {overlap_end.strftime('%Y-%m-%d %H:%M')})")
+    
+    if overlaps:
+        warnings.append(f"⚠️ Overlapping timestamps detected between: {'; '.join(overlaps)}")
+    
+    return {
+        "compatible": True,  # Still compatible, just with warnings
+        "warnings": warnings,
+        "common_columns": sorted(list(common)),
+        "time_ranges": time_ranges
+    }
+
+def create_stacked_dataframe(file_data: dict, file_names: list[str], overlap_handling: str) -> tuple[pd.DataFrame, int]:
+    """
+    Stack multiple files into a single DataFrame.
+    Returns (stacked_df, header_row).
+    """
+    dfs = []
+    
+    for fn in file_names:
+        df, _ = load_file(file_data[fn]["raw_bytes"], fn)
+        
+        # Set datetime index
+        dt_col = detect_datetime_column(df)
+        if dt_col:
+            df[dt_col] = pd.to_datetime(df[dt_col], errors='coerce')
+            df = df.set_index(dt_col)
+        
+        # Drop any remaining datetime-like columns or index columns before stacking
+        cols_to_keep = []
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            if "date" in col_lower or "time" in col_lower:
+                continue
+            if col_lower in ("index", "idx", "unnamed: 0") or col_lower.startswith("unnamed:"):
+                continue
+            cols_to_keep.append(col)
+        
+        df = df[cols_to_keep]
+        dfs.append(df)
+    
+    # Get common columns only
+    common_cols = set(dfs[0].columns)
+    for df in dfs[1:]:
+        common_cols = common_cols.intersection(set(df.columns))
+    common_cols = sorted(list(common_cols))
+    
+    if not common_cols:
+        # If no common columns, return empty dataframe
+        return pd.DataFrame(), 0
+    
+    # Filter to common columns and concatenate
+    dfs_filtered = [df[common_cols] for df in dfs]
+    stacked = pd.concat(dfs_filtered, axis=0)
+    stacked = stacked.sort_index()
+    
+    # Remove rows with NaT index
+    stacked = stacked[stacked.index.notna()]
+    
+    # Handle overlapping timestamps
+    if stacked.index.has_duplicates:
+        if overlap_handling == "Keep first occurrence":
+            stacked = stacked[~stacked.index.duplicated(keep='first')]
+        elif overlap_handling == "Keep last occurrence":
+            stacked = stacked[~stacked.index.duplicated(keep='last')]
+        elif overlap_handling == "Average values":
+            # For averaging, handle numeric and non-numeric separately
+            numeric_cols = stacked.select_dtypes(include='number').columns.tolist()
+            non_numeric_cols = [c for c in stacked.columns if c not in numeric_cols]
+            
+            if numeric_cols:
+                numeric_avg = stacked[numeric_cols].groupby(stacked.index).mean()
+            else:
+                numeric_avg = pd.DataFrame(index=stacked.index.unique())
+            
+            if non_numeric_cols:
+                non_numeric_first = stacked[non_numeric_cols].groupby(stacked.index).first()
+                stacked = pd.concat([numeric_avg, non_numeric_first], axis=1)
+            else:
+                stacked = numeric_avg
+    
+    return stacked, 0
+
 def get_column_types(df: pd.DataFrame, columns: list[str]) -> dict[str, str]:
     """
     Determine the data type for each column.
@@ -132,12 +274,45 @@ def prepare_dataframe(df: pd.DataFrame, dupe_handling: str = "Average values") -
     df = df[df.index.notna()]
     
     if df.index.has_duplicates:
+        # Separate numeric and non-numeric columns
+        numeric_cols = df.select_dtypes(include='number').columns.tolist()
+        non_numeric_cols = [c for c in df.columns if c not in numeric_cols]
+        
         if dupe_handling == "Average values":
-            df = df.groupby(df.index).mean(numeric_only=True)
+            if numeric_cols:
+                numeric_df = df[numeric_cols].groupby(df.index).mean()
+            else:
+                numeric_df = pd.DataFrame(index=df.index.unique())
+            
+            if non_numeric_cols:
+                non_numeric_df = df[non_numeric_cols].groupby(df.index).first()
+                df = pd.concat([numeric_df, non_numeric_df], axis=1)
+            else:
+                df = numeric_df
+                
         elif dupe_handling == "Maximum value":
-            df = df.groupby(df.index).max(numeric_only=True)
+            if numeric_cols:
+                numeric_df = df[numeric_cols].groupby(df.index).max()
+            else:
+                numeric_df = pd.DataFrame(index=df.index.unique())
+            
+            if non_numeric_cols:
+                non_numeric_df = df[non_numeric_cols].groupby(df.index).first()
+                df = pd.concat([numeric_df, non_numeric_df], axis=1)
+            else:
+                df = numeric_df
+                
         elif dupe_handling == "Minimum value":
-            df = df.groupby(df.index).min(numeric_only=True)
+            if numeric_cols:
+                numeric_df = df[numeric_cols].groupby(df.index).min()
+            else:
+                numeric_df = pd.DataFrame(index=df.index.unique())
+            
+            if non_numeric_cols:
+                non_numeric_df = df[non_numeric_cols].groupby(df.index).first()
+                df = pd.concat([numeric_df, non_numeric_df], axis=1)
+            else:
+                df = numeric_df
     
     return df
 
@@ -184,6 +359,8 @@ if "file_data" not in st.session_state:
     st.session_state.file_data = {}
 if "graph_fig" not in st.session_state:
     st.session_state.graph_fig = None
+if "stacked_datasets" not in st.session_state:
+    st.session_state.stacked_datasets = {}  # name -> {files: [], overlap_handling: str}
 
 # --- Step 1: File Upload ---
 st.header("📁 Upload CSV, XLS, or XLSX Files")
@@ -198,10 +375,14 @@ start_dates = []
 if uploaded_files:
     file_data = {}
     
+    # Track which files were uploaded to clean up stale stacks
+    uploaded_names = set()
+    
     for file in uploaded_files:
         raw_bytes = file.getvalue()
         df_preview, header_row = load_file(raw_bytes, file.name)
         df_preview_short = df_preview.head(2)
+        uploaded_names.add(file.name)
         
         if header_row > 0:
             st.caption(f"Detected data starting on line {header_row + 1} in {file.name}")
@@ -237,19 +418,216 @@ if uploaded_files:
             except Exception:
                 pass
 
+    # Clean up stacks that reference files no longer uploaded
+    stacks_to_remove = []
+    for stack_name, stack_info in st.session_state.stacked_datasets.items():
+        if not all(fn in uploaded_names for fn in stack_info["files"]):
+            stacks_to_remove.append(stack_name)
+    
+    for stack_name in stacks_to_remove:
+        del st.session_state.stacked_datasets[stack_name]
+    
+    if stacks_to_remove:
+        st.warning(f"Removed stacks with missing files: {', '.join(stacks_to_remove)}")
+    
+    # Restore existing stacked datasets to file_data
+    for stack_name, stack_info in st.session_state.stacked_datasets.items():
+        # Recreate the stacked dataframe
+        stacked_df, _ = create_stacked_dataframe(file_data, stack_info["files"], stack_info["overlap_handling"])
+        
+        if not stacked_df.empty and len(stacked_df.columns) > 0:
+            stacked_df_reset = stacked_df.reset_index()
+            if stacked_df_reset.columns[0] == 'index':
+                stacked_df_reset = stacked_df_reset.rename(columns={'index': 'DateTime'})
+            
+            stacked_bytes = stacked_df_reset.to_csv(index=False).encode('utf-8')
+            selectable_cols = get_selectable_columns(stacked_df_reset)
+            
+            # Preserve any previously selected columns/settings if they exist
+            old_meta = st.session_state.file_data.get(stack_name, {})
+            
+            file_data[stack_name] = {
+                "preview": stacked_df_reset.head(2),
+                "columns": selectable_cols,
+                "column_types": get_column_types(stacked_df_reset, selectable_cols),
+                "raw_bytes": stacked_bytes,
+                "selected_cols": old_meta.get("selected_cols", {}),
+                "units": old_meta.get("units", {}),
+                "cleanup": old_meta.get("cleanup", {}),
+                "dupe_handling": old_meta.get("dupe_handling", "Average values"),
+                "is_stacked": True
+            }
+    
     st.session_state.file_data = file_data
     st.success(f"✅ Uploaded {len(uploaded_files)} files!")
+
+file_data = st.session_state.file_data
+
+# --- Step 1.5: Stack Files from Same Equipment (Optional) ---
+if file_data and len(file_data) > 1:
+    st.header("📚 Stack Files from Same Equipment (Optional)")
+    st.write("If you have multiple files from the same equipment covering different time periods, you can combine them into a single dataset here.")
+    
+    # Show existing stacks
+    if st.session_state.stacked_datasets:
+        st.subheader("Current Stacked Datasets")
+        stacks_to_remove = []
+        
+        for stack_name, stack_info in st.session_state.stacked_datasets.items():
+            files_in_stack = stack_info["files"]
+            col1, col2 = st.columns([4, 1])
+            
+            with col1:
+                # Calculate date range for display
+                time_ranges = []
+                for fn in files_in_stack:
+                    if fn in file_data:
+                        df, _ = load_file(file_data[fn]["raw_bytes"], fn)
+                        dt_col = detect_datetime_column(df)
+                        if dt_col:
+                            times = pd.to_datetime(df[dt_col], errors='coerce').dropna()
+                            if len(times) > 0:
+                                time_ranges.append((times.min(), times.max()))
+                
+                if time_ranges:
+                    overall_start = min(t[0] for t in time_ranges)
+                    overall_end = max(t[1] for t in time_ranges)
+                    date_str = f"{overall_start.strftime('%Y-%m-%d')} to {overall_end.strftime('%Y-%m-%d')}"
+                else:
+                    date_str = "Unknown date range"
+                
+                st.info(f"📊 **{stack_name}**: {', '.join(files_in_stack)} — {date_str}")
+            
+            with col2:
+                if st.button("🗑️ Remove", key=f"remove_stack_{stack_name}"):
+                    stacks_to_remove.append(stack_name)
+        
+        # Remove marked stacks
+        for stack_name in stacks_to_remove:
+            del st.session_state.stacked_datasets[stack_name]
+            st.rerun()
+    
+    # Create new stack
+    with st.expander("➕ Create a new stacked dataset", expanded=not st.session_state.stacked_datasets):
+        # Get files not already in a stack
+        files_in_stacks = set()
+        for stack_info in st.session_state.stacked_datasets.values():
+            files_in_stacks.update(stack_info["files"])
+        
+        available_files = [fn for fn in file_data.keys() if fn not in files_in_stacks]
+        
+        if len(available_files) < 2:
+            st.info("You need at least 2 unstacked files to create a new stack.")
+        else:
+            stack_files = st.multiselect(
+                "Select files to stack together:",
+                options=available_files,
+                key="new_stack_files"
+            )
+            
+            if len(stack_files) >= 2:
+                # Check compatibility
+                compat = check_stack_compatibility(file_data, stack_files)
+                
+                # Show warnings
+                for warning in compat["warnings"]:
+                    st.warning(warning)
+                
+                # Show time ranges
+                if compat.get("time_ranges"):
+                    st.write("**Time ranges in selected files:**")
+                    for fn, start, end in compat["time_ranges"]:
+                        st.caption(f"  • {fn}: {start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')}")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    stack_name = st.text_input(
+                        "Name for this stacked dataset:",
+                        value=f"Stacked Data {len(st.session_state.stacked_datasets) + 1}",
+                        key="new_stack_name"
+                    )
+                
+                with col2:
+                    overlap_handling = st.selectbox(
+                        "If timestamps overlap:",
+                        ["Keep first occurrence", "Keep last occurrence", "Average values"],
+                        key="new_stack_overlap"
+                    )
+                
+                if st.button("✅ Create Stack", key="create_stack_btn"):
+                    if stack_name and stack_name not in st.session_state.stacked_datasets:
+                        # Create the stacked dataset
+                        stacked_df, _ = create_stacked_dataframe(file_data, stack_files, overlap_handling)
+                        
+                        if stacked_df.empty or len(stacked_df.columns) == 0:
+                            st.error("❌ Could not create stack: No common data columns found between the selected files.")
+                        else:
+                            # Reset index to make datetime a regular column for storage
+                            stacked_df_reset = stacked_df.reset_index()
+                            
+                            # Rename the index column to something recognizable as datetime
+                            if stacked_df_reset.columns[0] == 'index':
+                                stacked_df_reset = stacked_df_reset.rename(columns={'index': 'DateTime'})
+                            
+                            # Convert to CSV bytes for storage
+                            stacked_bytes = stacked_df_reset.to_csv(index=False).encode('utf-8')
+                            
+                            # Get selectable columns (excludes the datetime column)
+                            selectable_cols = get_selectable_columns(stacked_df_reset)
+                            
+                            # Store stack info
+                            st.session_state.stacked_datasets[stack_name] = {
+                                "files": stack_files,
+                                "overlap_handling": overlap_handling
+                            }
+                            
+                            # Add stacked dataset to file_data as a virtual file
+                            file_data[stack_name] = {
+                                "preview": stacked_df_reset.head(2),
+                                "columns": selectable_cols,
+                                "column_types": get_column_types(stacked_df_reset, selectable_cols),
+                                "raw_bytes": stacked_bytes,
+                                "selected_cols": {},
+                                "units": {},
+                                "cleanup": {},
+                                "dupe_handling": "Average values",
+                                "is_stacked": True
+                            }
+                            
+                            st.session_state.file_data = file_data
+                            st.success(f"✅ Created stacked dataset '{stack_name}' with {len(selectable_cols)} available columns!")
+                            st.rerun()
+                    elif stack_name in st.session_state.stacked_datasets:
+                        st.error("A stack with this name already exists. Please choose a different name.")
+                    else:
+                        st.error("Please enter a name for the stacked dataset.")
+            elif len(stack_files) == 1:
+                st.info("Select at least 2 files to stack together.")
 
 file_data = st.session_state.file_data
 
 # --- Step 2: Column Selection & Cleanup ---
 if file_data:
     st.header("🧹 Select Columns, Data Titles, & Cleanup Options")
+    
+    # Get files that are part of stacks (to hide them)
+    files_in_stacks = set()
+    for stack_info in st.session_state.stacked_datasets.values():
+        files_in_stacks.update(stack_info["files"])
 
     for file_name, meta in file_data.items():
+        # Skip files that are part of a stack (they're represented by the stacked dataset)
+        if file_name in files_in_stacks:
+            continue
+            
         df_preview = meta["preview"]
+        is_stacked = meta.get("is_stacked", False)
+        
+        # Different icon for stacked vs regular files
+        icon = "📚" if is_stacked else "📈"
+        label = f"{icon} {'Stacked: ' if is_stacked else ''}{file_name}"
 
-        with st.expander(f"📈 Data available from: {file_name}", expanded=False):
+        with st.expander(f"{label}", expanded=False):
             st.dataframe(df_preview)
 
             st.markdown(
@@ -327,7 +705,17 @@ if file_data:
     # Build list of available columns from all files (numeric only for graphing)
     available_columns = []
     string_columns_skipped = []
+    
+    # Get files that are part of stacks (to exclude them)
+    files_in_stacks = set()
+    for stack_info in st.session_state.stacked_datasets.values():
+        files_in_stacks.update(stack_info["files"])
+    
     for file_name, meta in file_data.items():
+        # Skip files that are part of a stack
+        if file_name in files_in_stacks:
+            continue
+            
         for col, title in meta.get("selected_cols", {}).items():
             col_type = meta.get("column_types", {}).get(col, "numeric")
             if col_type == "string":
@@ -365,7 +753,7 @@ if file_data:
                         files_to_columns[fn] = []
                     files_to_columns[fn].append(item)
 
-            combined_plot_df = pd.DataFrame()
+            all_series = {}
             progress = st.progress(0, text="Loading data for plotting...")
             
             total_files = len(files_to_columns)
@@ -373,22 +761,38 @@ if file_data:
                 meta = file_data[file_name]
                 
                 # Load file ONCE per file (not per column)
-                df_full, _ = load_file(meta["raw_bytes"], file_name)
+                is_stacked = meta.get("is_stacked", False)
+                df_full, _ = load_file(meta["raw_bytes"], file_name, is_stacked=is_stacked)
                 df_full = prepare_dataframe(df_full, meta.get("dupe_handling", "Average values"))
+                
+                # Build column mapping (case-insensitive, strip whitespace)
+                col_map = {c.lower().strip(): c for c in df_full.columns}
                 
                 # Extract all requested columns from this file
                 for item in columns:
                     col = item["col"]
                     label = item["label"]
                     
-                    # Case-insensitive column matching
-                    col_map = {c.lower().strip(): c for c in df_full.columns}
-                    matched_col = col_map.get(col.lower().strip())
+                    # Try exact match first, then case-insensitive
+                    if col in df_full.columns:
+                        matched_col = col
+                    else:
+                        matched_col = col_map.get(col.lower().strip())
                     
-                    if matched_col and not df_full[matched_col].dropna().empty:
-                        combined_plot_df[label] = pd.to_numeric(df_full[matched_col], errors="coerce")
+                    if matched_col and matched_col in df_full.columns:
+                        series_data = pd.to_numeric(df_full[matched_col], errors="coerce")
+                        if not series_data.dropna().empty:
+                            # Store as a Series with its datetime index
+                            all_series[label] = series_data
 
                 progress.progress(i / total_files, text=f"Loaded {i} of {total_files} files")
+            
+            # Combine all series into a single DataFrame with aligned index
+            if all_series:
+                combined_plot_df = pd.DataFrame(all_series)
+                combined_plot_df = combined_plot_df.sort_index()
+            else:
+                combined_plot_df = pd.DataFrame()
 
             progress.progress(1.0, text="✅ Data ready for plotting")
 
@@ -396,12 +800,24 @@ if file_data:
                 st.warning("No valid data found for the selected columns.")
             else:
                 combined_plot_df = combined_plot_df.sort_index()
-                fig = px.line(
-                    combined_plot_df,
-                    x=combined_plot_df.index,
-                    y=combined_plot_df.columns,
+                
+                # Debug info
+                st.caption(f"📊 Plotting {len(combined_plot_df.columns)} columns with {len(combined_plot_df)} data points")
+                
+                # Melt the dataframe for better plotly express handling
+                plot_df = combined_plot_df.reset_index()
+                plot_df = plot_df.rename(columns={plot_df.columns[0]: 'DateTime'})
+                plot_df_melted = plot_df.melt(id_vars=['DateTime'], var_name='Column', value_name='Value')
+                
+                # Remove NaN values for cleaner plotting
+                plot_df_melted = plot_df_melted.dropna(subset=['Value'])
+                
+                fig = px.scatter(
+                    plot_df_melted,
+                    x='DateTime',
+                    y='Value',
+                    color='Column',
                     title="Combined Data Plot (All Files)",
-                    labels={"x": "Date/Time", "value": "Value", "variable": "Column"},
                 )
                 fig.update_layout(
                     height=600,
@@ -458,9 +874,22 @@ if file_data:
     st.subheader("📉 Interval Alignment Strategy")
     with st.expander("💡 If your data is on the selected time interval, nothing will be changed. If it is not, it will be resampled according to your selections below."):
         alignment_opts = {}
+        
+        # Get files that are part of stacks (to exclude them)
+        files_in_stacks = set()
+        for stack_info in st.session_state.stacked_datasets.values():
+            files_in_stacks.update(stack_info["files"])
+        
         for file_name in file_data.keys():
+            # Skip files that are part of a stack
+            if file_name in files_in_stacks:
+                continue
+                
+            is_stacked = file_data[file_name].get("is_stacked", False)
+            display_name = f"{'📚 Stacked: ' if is_stacked else ''}{file_name}"
+            
             alignment_opts[file_name] = st.selectbox(
-                f"Data from '{file_name}':",
+                f"Data from '{display_name}':",
                 [
                     "Fill with the nearest value",
                     "Do a linear interpolation from the nearest values",
@@ -488,13 +917,23 @@ if file_data:
         row11 = [""]
 
         progress = st.progress(0, text="Starting file processing...")
+        
+        # Get files that are part of stacks (to exclude them)
+        files_in_stacks = set()
+        for stack_info in st.session_state.stacked_datasets.values():
+            files_in_stacks.update(stack_info["files"])
+        
+        # Filter to only process non-stacked source files
+        files_to_process = {fn: meta for fn, meta in file_data.items() if fn not in files_in_stacks}
+        total_files = len(files_to_process)
 
-        for i, (file_name, meta) in enumerate(file_data.items(), start=1):
+        for i, (file_name, meta) in enumerate(files_to_process.items(), start=1):
             if not meta.get("selected_cols"):
                 continue
                 
             # Load and prepare file
-            df, _ = load_file(meta["raw_bytes"], file_name)
+            is_stacked = meta.get("is_stacked", False)
+            df, _ = load_file(meta["raw_bytes"], file_name, is_stacked=is_stacked)
             df = prepare_dataframe(df, meta.get("dupe_handling", "Average values"))
 
             # Apply cleanup choices
@@ -537,9 +976,13 @@ if file_data:
                 row10.append(title)
                 row11.append(meta.get("units", {}).get(col, ""))
 
-            progress.progress(i / len(file_data), text=f"Processed {i} of {len(file_data)} files...")
+            progress.progress(i / total_files, text=f"Processed {i} of {total_files} files...")
 
         progress.progress(1.0, text="All files processed ✅")
+        
+        # Remove rows where ALL data columns are NaN (keeps rows with at least some data)
+        if not combined.empty:
+            combined = combined.dropna(how='all')
 
         # Insert into Excel template
         try:
@@ -561,10 +1004,17 @@ if file_data:
 
             # Row 12 onward - Data
             for r, (ts, row_vals) in enumerate(combined.iterrows(), start=12):
+                # Skip if timestamp is NaT
+                if pd.isna(ts):
+                    continue
+                    
                 cell = ws.cell(row=r, column=2, value=ts)
                 cell._style = copy(template_formats.get(2, cell._style))
 
                 for c, val in enumerate(row_vals, start=3):
+                    # Convert NaN to None for cleaner Excel output
+                    if pd.isna(val):
+                        val = None
                     cell = ws.cell(row=r, column=c, value=val)
                     if c in template_formats:
                         cell._style = copy(template_formats[c])
