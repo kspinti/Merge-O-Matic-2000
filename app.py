@@ -10,18 +10,23 @@ from pathlib import Path
 
 # --- Cached file reading for performance ---
 @st.cache_data
-def load_file(file_bytes: bytes, file_name: str, is_stacked: bool = False) -> tuple[pd.DataFrame, int]:
+def load_file(file_bytes: bytes, file_name: str, is_stacked: bool = False, is_pivoted: bool = False) -> tuple[pd.DataFrame, int]:
     """Load CSV or Excel file with caching to avoid redundant reads."""
-    # Stacked datasets are always stored as CSV
-    if is_stacked or file_name.lower().endswith(".csv"):
+    # Stacked and pivoted datasets are always stored as CSV
+    if is_stacked or is_pivoted or file_name.lower().endswith(".csv"):
         return read_flexible_csv(file_bytes)
     else:
         return pd.read_excel(io.BytesIO(file_bytes)), 0
 
-def read_flexible_csv(file_bytes: bytes, max_check_lines: int = 30) -> tuple[pd.DataFrame, int]:
+def read_flexible_csv(file_bytes: bytes, max_check_lines: int = 50) -> tuple[pd.DataFrame, int]:
     """
     Read a CSV file that may have extra header or junk lines before the real data.
     Automatically detects which line contains the column headers.
+    
+    Handles files with metadata headers (like HIOKI power meters) by looking for:
+    - Lines with many columns (data tables typically have more columns than metadata)
+    - Lines containing typical column header patterns (brackets, underscores)
+    - The line with the most columns that appears to be a header
     """
     text = file_bytes.decode(errors="ignore").splitlines()
     
@@ -30,26 +35,83 @@ def read_flexible_csv(file_bytes: bytes, max_check_lines: int = 30) -> tuple[pd.
         return pd.DataFrame(), 0
     
     sample_lines = text[:max_check_lines]
-
-    header_row = 0
+    
+    # Strategy: Find the best candidate for a header row
+    # A good header row has:
+    # 1. Multiple columns
+    # 2. Non-numeric values (column names)
+    # 3. Often contains patterns like [units], underscores, "Date", "Time", etc.
+    
+    best_header_row = 0
+    best_score = 0
+    
     for i, line in enumerate(sample_lines):
-        parts = [p.strip() for p in line.replace("\t", ",").split(",") if p.strip()]
+        # Skip empty lines
+        if not line.strip():
+            continue
+            
+        parts = [p.strip().strip('"') for p in line.replace("\t", ",").split(",") if p.strip()]
+        
         if len(parts) < 2:
             continue
-
-        non_numeric = sum(1 for p in parts if not p.replace(".", "").replace("-", "").replace(":", "").replace("/", "").isdigit())
-        if non_numeric / len(parts) >= 0.5:
-            header_row = i
-            break
+        
+        # Calculate a score for this line being a header
+        score = 0
+        
+        # More columns = higher score (data tables have more columns than metadata)
+        score += len(parts) * 2
+        
+        # Check for header-like patterns
+        header_patterns = 0
+        for p in parts:
+            p_lower = p.lower()
+            # Contains brackets (units like [Hz], [V], [W])
+            if '[' in p and ']' in p:
+                header_patterns += 3
+            # Contains underscores (common in column names like Freq_Avg)
+            if '_' in p:
+                header_patterns += 2
+            # Common column name keywords
+            if any(kw in p_lower for kw in ['date', 'time', 'avg', 'max', 'min', 'value', 'status']):
+                header_patterns += 2
+            # Looks like a label (starts with letter, not a pure number)
+            if p and p[0].isalpha():
+                header_patterns += 1
+        
+        score += header_patterns
+        
+        # Penalize lines that look like metadata (key-value pairs with only 2-3 parts)
+        if len(parts) <= 3:
+            score -= 10
+        
+        # Penalize lines that start with quotes (often metadata descriptions)
+        if line.strip().startswith('"') and len(parts) <= 3:
+            score -= 15
+            
+        # Check if most values are non-numeric (headers should be mostly text)
+        non_numeric = sum(1 for p in parts if not p.replace(".", "").replace("-", "").replace(":", "").replace("/", "").replace("E", "").replace("+", "").isdigit())
+        if len(parts) > 0 and non_numeric / len(parts) >= 0.5:
+            score += 10
+        
+        if score > best_score:
+            best_score = score
+            best_header_row = i
 
     try:
-        df = pd.read_csv(io.BytesIO(file_bytes), header=header_row, low_memory=False)
+        # Use skiprows to skip to the header row, then pandas will use that as the header
+        df = pd.read_csv(io.BytesIO(file_bytes), skiprows=best_header_row, low_memory=False)
         # Remove any completely empty rows at the start
         df = df.dropna(how='all').reset_index(drop=True)
+        
+        # Also remove rows where the first column matches the header (sometimes happens with START markers)
+        if len(df) > 0 and len(df.columns) > 1:
+            # Keep rows where at least some data columns have values
+            df = df.dropna(subset=df.columns[1:], how='all').reset_index(drop=True)
+                
     except Exception:
         df = pd.read_csv(io.BytesIO(file_bytes), header=0, low_memory=False)
 
-    return df, header_row
+    return df, best_header_row
 
 def detect_datetime_column(df: pd.DataFrame) -> str | None:
     """Find the first column that looks like a datetime column."""
@@ -112,6 +174,181 @@ def is_string_column(series: pd.Series) -> bool:
     
     return False
 
+def detect_long_format(df: pd.DataFrame) -> dict:
+    """
+    Detect if the dataframe appears to be in 'long' format with repeated tag names.
+    Returns a dict with detection results and suggested columns.
+    
+    Long format characteristics:
+    - A column with string values that repeat many times (tag names)
+    - A column with numeric values (the actual data values)
+    - Multiple rows per timestamp
+    """
+    result = {
+        "is_long_format": False,
+        "tag_column": None,
+        "value_column": None,
+        "date_columns": [],
+        "extra_columns": [],
+        "confidence": 0.0
+    }
+    
+    if len(df) < 10:  # Need enough rows to detect pattern
+        return result
+    
+    # Find potential tag columns (string columns with high repetition)
+    potential_tag_cols = []
+    for col in df.columns:
+        col_lower = col.lower().strip()
+        
+        # Skip obvious date/time columns
+        if "date" in col_lower or "time" in col_lower:
+            result["date_columns"].append(col)
+            continue
+        
+        # Skip index-like columns
+        if col_lower in ("index", "idx", "id", "row", "unnamed: 0") or col_lower.startswith("unnamed:"):
+            continue
+        
+        # Check if it's a string column with repetition
+        if df[col].dtype == object or df[col].dtype.name == 'string':
+            unique_count = df[col].nunique()
+            total_count = len(df[col].dropna())
+            
+            if total_count > 0 and unique_count > 0:
+                repetition_ratio = total_count / unique_count
+                
+                # If values repeat on average more than 3 times, it's likely a tag column
+                if repetition_ratio > 3 and unique_count < total_count * 0.5:
+                    # Bonus points if column name suggests it's a tag/name column
+                    name_score = 0
+                    if any(kw in col_lower for kw in ["tag", "name", "variable", "parameter", "channel", "point"]):
+                        name_score = 0.3
+                    
+                    potential_tag_cols.append({
+                        "column": col,
+                        "unique_count": unique_count,
+                        "repetition_ratio": repetition_ratio,
+                        "score": repetition_ratio + name_score
+                    })
+    
+    if not potential_tag_cols:
+        return result
+    
+    # Sort by score and pick the best candidate
+    potential_tag_cols.sort(key=lambda x: x["score"], reverse=True)
+    best_tag_col = potential_tag_cols[0]
+    
+    # Find potential value columns (numeric columns)
+    potential_value_cols = []
+    for col in df.columns:
+        col_lower = col.lower().strip()
+        
+        # Skip date/time and the tag column
+        if col in result["date_columns"] or col == best_tag_col["column"]:
+            continue
+        
+        # Check if it's numeric
+        if pd.api.types.is_numeric_dtype(df[col]):
+            # Bonus for column names that suggest values
+            name_score = 0
+            if any(kw in col_lower for kw in ["value", "val", "data", "reading", "measurement"]):
+                name_score = 0.5
+            
+            non_null_ratio = df[col].notna().sum() / len(df)
+            potential_value_cols.append({
+                "column": col,
+                "non_null_ratio": non_null_ratio,
+                "score": non_null_ratio + name_score
+            })
+    
+    if not potential_value_cols:
+        return result
+    
+    # Sort and pick the best value column
+    potential_value_cols.sort(key=lambda x: x["score"], reverse=True)
+    best_value_col = potential_value_cols[0]
+    
+    # Identify extra columns (columns that aren't date, tag, or value)
+    used_cols = set(result["date_columns"] + [best_tag_col["column"], best_value_col["column"]])
+    result["extra_columns"] = [c for c in df.columns if c not in used_cols and not c.lower().startswith("unnamed:")]
+    
+    # Calculate confidence score
+    confidence = min(1.0, (best_tag_col["repetition_ratio"] / 10) * 0.5 + 0.5)
+    
+    result["is_long_format"] = True
+    result["tag_column"] = best_tag_col["column"]
+    result["value_column"] = best_value_col["column"]
+    result["confidence"] = confidence
+    
+    return result
+
+def pivot_long_to_wide(df: pd.DataFrame, tag_col: str, value_col: str, 
+                       date_cols: list[str], aggfunc: str = 'first') -> pd.DataFrame:
+    """
+    Pivot a long-format dataframe to wide format.
+    
+    Args:
+        df: Input dataframe in long format
+        tag_col: Column containing tag/variable names
+        value_col: Column containing the values
+        date_cols: List of columns to combine into DateTime
+        aggfunc: How to handle duplicate tag+time combinations ('first', 'mean', 'max', 'min')
+    
+    Returns:
+        Wide-format dataframe with DateTime index and tags as columns
+    """
+    df = df.copy()
+    
+    # Clean column names
+    df.columns = df.columns.str.strip()
+    
+    # Handle the ;Date column naming quirk
+    if ';Date' in df.columns:
+        df.rename(columns={';Date': 'Date'}, inplace=True)
+        # Update date_cols if it contains ;Date
+        date_cols = ['Date' if c == ';Date' else c for c in date_cols]
+    
+    # Build DateTime from date columns
+    if len(date_cols) == 1:
+        df["DateTime"] = pd.to_datetime(df[date_cols[0]], errors="coerce")
+    elif len(date_cols) >= 2:
+        # Assume first is date, second is time
+        df[date_cols[0]] = df[date_cols[0]].astype(str)
+        df[date_cols[1]] = df[date_cols[1]].astype(str)
+        df["DateTime"] = pd.to_datetime(df[date_cols[0]] + " " + df[date_cols[1]], errors="coerce")
+    else:
+        raise ValueError("At least one date column is required")
+    
+    # Select aggregation function
+    agg_map = {
+        'first': 'first',
+        'mean': 'mean',
+        'max': 'max',
+        'min': 'min',
+        'last': 'last'
+    }
+    agg = agg_map.get(aggfunc, 'first')
+    
+    # Pivot the data
+    pivot_df = df.pivot_table(
+        index="DateTime", 
+        columns=tag_col, 
+        values=value_col, 
+        aggfunc=agg
+    )
+    
+    # Sort by DateTime
+    pivot_df.sort_index(inplace=True)
+    
+    # Remove rows with NaT index
+    pivot_df = pivot_df[pivot_df.index.notna()]
+    
+    # Reset index to make DateTime a regular column
+    pivot_df = pivot_df.reset_index()
+    
+    return pivot_df
+
 def check_stack_compatibility(file_data: dict, file_names: list[str]) -> dict:
     """
     Check if files are compatible for stacking.
@@ -125,7 +362,9 @@ def check_stack_compatibility(file_data: dict, file_names: list[str]) -> dict:
     all_dfs = []
     
     for fn in file_names:
-        df, _ = load_file(file_data[fn]["raw_bytes"], fn)
+        is_stacked = file_data[fn].get("is_stacked", False)
+        is_pivoted = file_data[fn].get("is_pivoted", False)
+        df, _ = load_file(file_data[fn]["raw_bytes"], fn, is_stacked=is_stacked, is_pivoted=is_pivoted)
         selectable = get_selectable_columns(df)
         all_columns.append(set(selectable))
         all_dfs.append((fn, df))
@@ -183,7 +422,9 @@ def create_stacked_dataframe(file_data: dict, file_names: list[str], overlap_han
     dfs = []
     
     for fn in file_names:
-        df, _ = load_file(file_data[fn]["raw_bytes"], fn)
+        is_stacked = file_data[fn].get("is_stacked", False)
+        is_pivoted = file_data[fn].get("is_pivoted", False)
+        df, _ = load_file(file_data[fn]["raw_bytes"], fn, is_stacked=is_stacked, is_pivoted=is_pivoted)
         
         # Set datetime index
         dt_col = detect_datetime_column(df)
@@ -361,6 +602,8 @@ if "graph_fig" not in st.session_state:
     st.session_state.graph_fig = None
 if "stacked_datasets" not in st.session_state:
     st.session_state.stacked_datasets = {}  # name -> {files: [], overlap_handling: str}
+if "pivot_settings" not in st.session_state:
+    st.session_state.pivot_settings = {}  # file_name -> {enabled: bool, tag_col, value_col, date_cols, aggfunc}
 
 # --- Step 1: File Upload ---
 st.header("📁 Upload CSV, XLS, or XLSX Files")
@@ -375,17 +618,44 @@ start_dates = []
 if uploaded_files:
     file_data = {}
     
-    # Track which files were uploaded to clean up stale stacks
+    # Track which files were uploaded to clean up stale stacks and pivots
     uploaded_names = set()
     
     for file in uploaded_files:
         raw_bytes = file.getvalue()
         df_preview, header_row = load_file(raw_bytes, file.name)
-        df_preview_short = df_preview.head(2)
         uploaded_names.add(file.name)
         
         if header_row > 0:
             st.caption(f"Detected data starting on line {header_row + 1} in {file.name}")
+        
+        # Check if this file appears to be in long format (needs pivoting)
+        long_format_info = detect_long_format(df_preview)
+        
+        # Check if pivot is already enabled for this file
+        pivot_settings = st.session_state.pivot_settings.get(file.name, {})
+        pivot_enabled = pivot_settings.get("enabled", False)
+        
+        # If long format detected and pivot enabled, apply the pivot
+        if long_format_info["is_long_format"] and pivot_enabled:
+            try:
+                tag_col = pivot_settings.get("tag_col", long_format_info["tag_column"])
+                value_col = pivot_settings.get("value_col", long_format_info["value_column"])
+                date_cols = pivot_settings.get("date_cols", long_format_info["date_columns"])
+                aggfunc = pivot_settings.get("aggfunc", "first")
+                
+                df_pivoted = pivot_long_to_wide(df_preview, tag_col, value_col, date_cols, aggfunc)
+                df_preview = df_pivoted
+                
+                # Also pivot the full data and store as new raw_bytes
+                df_full, _ = load_file(raw_bytes, file.name)
+                df_full_pivoted = pivot_long_to_wide(df_full, tag_col, value_col, date_cols, aggfunc)
+                raw_bytes = df_full_pivoted.to_csv(index=False).encode('utf-8')
+                
+            except Exception as e:
+                st.error(f"Error pivoting {file.name}: {e}")
+        
+        df_preview_short = df_preview.head(2)
 
         file_data[file.name] = {
             "preview": df_preview_short,
@@ -395,8 +665,75 @@ if uploaded_files:
             "selected_cols": {},
             "units": {},
             "cleanup": {},
-            "dupe_handling": "Average values"
+            "dupe_handling": "Average values",
+            "long_format_info": long_format_info,
+            "is_pivoted": pivot_enabled
         }
+
+        # Show pivot option if long format detected
+        if long_format_info["is_long_format"] and not pivot_enabled:
+            with st.expander(f"🔄 **{file.name}**: Long format detected - Pivot to wide format?", expanded=True):
+                st.info(f"This file appears to contain repeated tag names in a 'long' format. "
+                       f"Found **{long_format_info['tag_column']}** as tag column with values repeated across rows.")
+                
+                st.write("**Detected columns:**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"• Tag column: `{long_format_info['tag_column']}`")
+                    st.write(f"• Value column: `{long_format_info['value_column']}`")
+                with col2:
+                    st.write(f"• Date columns: `{', '.join(long_format_info['date_columns'])}`")
+                    if long_format_info['extra_columns']:
+                        st.write(f"• Extra columns (will be dropped): `{', '.join(long_format_info['extra_columns'])}`")
+                
+                # Allow user to override detected columns
+                st.write("**Configure pivot settings:**")
+                all_cols = list(df_preview.columns)
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    tag_col_select = st.selectbox(
+                        "Tag name column",
+                        options=all_cols,
+                        index=all_cols.index(long_format_info["tag_column"]) if long_format_info["tag_column"] in all_cols else 0,
+                        key=f"pivot_tag_{file.name}"
+                    )
+                with col2:
+                    value_col_select = st.selectbox(
+                        "Value column",
+                        options=all_cols,
+                        index=all_cols.index(long_format_info["value_column"]) if long_format_info["value_column"] in all_cols else 0,
+                        key=f"pivot_value_{file.name}"
+                    )
+                with col3:
+                    aggfunc_select = st.selectbox(
+                        "If duplicate tag+time",
+                        options=["first", "last", "mean", "max", "min"],
+                        key=f"pivot_agg_{file.name}"
+                    )
+                
+                date_cols_select = st.multiselect(
+                    "Date/Time columns (select in order: Date first, then Time if separate)",
+                    options=all_cols,
+                    default=long_format_info["date_columns"],
+                    key=f"pivot_dates_{file.name}"
+                )
+                
+                if st.button(f"✅ Apply Pivot to {file.name}", key=f"pivot_btn_{file.name}"):
+                    st.session_state.pivot_settings[file.name] = {
+                        "enabled": True,
+                        "tag_col": tag_col_select,
+                        "value_col": value_col_select,
+                        "date_cols": date_cols_select,
+                        "aggfunc": aggfunc_select
+                    }
+                    st.rerun()
+        
+        elif pivot_enabled:
+            st.success(f"✅ **{file.name}** has been pivoted to wide format.")
+            if st.button(f"↩️ Undo pivot for {file.name}", key=f"unpivot_btn_{file.name}"):
+                del st.session_state.pivot_settings[file.name]
+                st.rerun()
 
         # Check for duplicate timestamps
         dt_col = detect_datetime_column(df_preview_short)
@@ -417,6 +754,11 @@ if uploaded_files:
                     start_dates.append(earliest)
             except Exception:
                 pass
+    
+    # Clean up pivot settings for files no longer uploaded
+    pivot_keys_to_remove = [fn for fn in st.session_state.pivot_settings if fn not in uploaded_names]
+    for fn in pivot_keys_to_remove:
+        del st.session_state.pivot_settings[fn]
 
     # Clean up stacks that reference files no longer uploaded
     stacks_to_remove = []
@@ -482,7 +824,9 @@ if file_data and len(file_data) > 1:
                 time_ranges = []
                 for fn in files_in_stack:
                     if fn in file_data:
-                        df, _ = load_file(file_data[fn]["raw_bytes"], fn)
+                        is_stacked = file_data[fn].get("is_stacked", False)
+                        is_pivoted = file_data[fn].get("is_pivoted", False)
+                        df, _ = load_file(file_data[fn]["raw_bytes"], fn, is_stacked=is_stacked, is_pivoted=is_pivoted)
                         dt_col = detect_datetime_column(df)
                         if dt_col:
                             times = pd.to_datetime(df[dt_col], errors='coerce').dropna()
@@ -508,7 +852,7 @@ if file_data and len(file_data) > 1:
             st.rerun()
     
     # Create new stack
-    with st.expander("➕ Create a new stacked dataset", expanded=not st.session_state.stacked_datasets):
+    with st.expander("🥞 Create a new stacked dataset", expanded=not st.session_state.stacked_datasets):
         # Get files not already in a stack
         files_in_stacks = set()
         for stack_info in st.session_state.stacked_datasets.values():
@@ -560,7 +904,7 @@ if file_data and len(file_data) > 1:
                         stacked_df, _ = create_stacked_dataframe(file_data, stack_files, overlap_handling)
                         
                         if stacked_df.empty or len(stacked_df.columns) == 0:
-                            st.error("❌ Could not create stack: No common data columns found between the selected files.")
+                            st.error("âŒ Could not create stack: No common data columns found between the selected files.")
                         else:
                             # Reset index to make datetime a regular column for storage
                             stacked_df_reset = stacked_df.reset_index()
@@ -649,7 +993,7 @@ if file_data:
                 col_type = meta.get("column_types", {}).get(col, "numeric")
                 is_string = col_type == "string"
                 
-                with st.expander(f"⚙️ Settings for {col}" + (" 📝" if is_string else ""), expanded=False):
+                with st.expander(f"⚙️ Settings for {col}" + (" 🔤" if is_string else ""), expanded=False):
                     if is_string:
                         st.warning(f"⚠️ '{col}' contains text/string data, not numbers. It will be preserved as text.")
                     
@@ -762,7 +1106,8 @@ if file_data:
                 
                 # Load file ONCE per file (not per column)
                 is_stacked = meta.get("is_stacked", False)
-                df_full, _ = load_file(meta["raw_bytes"], file_name, is_stacked=is_stacked)
+                is_pivoted = meta.get("is_pivoted", False)
+                df_full, _ = load_file(meta["raw_bytes"], file_name, is_stacked=is_stacked, is_pivoted=is_pivoted)
                 df_full = prepare_dataframe(df_full, meta.get("dupe_handling", "Average values"))
                 
                 # Build column mapping (case-insensitive, strip whitespace)
@@ -857,7 +1202,7 @@ if file_data:
     if range_mode == "End date":
         col1, col2 = st.columns(2)
         with col1:
-            end_date = st.date_input("End date", value=default_last)
+            end_date = st.date_input("🗓️ End date", value=default_last)
         with col2:
             end_time = st.time_input("End Time", value=datetime.strptime("00:00", "%H:%M").time())
         end_dt = datetime.combine(end_date, end_time)
@@ -866,7 +1211,7 @@ if file_data:
         end_dt = start_dt + pd.Timedelta(days=duration_days)
 
     interval = st.selectbox(
-        "⏳ Select output time interval",
+        "Select output time interval",
         ["1s", "30s", "1min", "5min", "10min", "15min", "1h", "1D"],
         index=2
     )
@@ -933,7 +1278,8 @@ if file_data:
                 
             # Load and prepare file
             is_stacked = meta.get("is_stacked", False)
-            df, _ = load_file(meta["raw_bytes"], file_name, is_stacked=is_stacked)
+            is_pivoted = meta.get("is_pivoted", False)
+            df, _ = load_file(meta["raw_bytes"], file_name, is_stacked=is_stacked, is_pivoted=is_pivoted)
             df = prepare_dataframe(df, meta.get("dupe_handling", "Average values"))
 
             # Apply cleanup choices
