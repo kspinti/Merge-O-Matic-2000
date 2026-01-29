@@ -16,7 +16,134 @@ def load_file(file_bytes: bytes, file_name: str, is_stacked: bool = False, is_pi
     if is_stacked or is_pivoted or file_name.lower().endswith(".csv"):
         return read_flexible_csv(file_bytes)
     else:
+        return read_flexible_excel(file_bytes)
+
+def read_flexible_excel(file_bytes: bytes, max_check_lines: int = 50) -> tuple[pd.DataFrame, int]:
+    """
+    Read an Excel file that may have extra header or junk lines before the real data.
+    Automatically detects which row contains the column headers.
+    Also checks all sheets and selects the one with the best/most data.
+    
+    Handles files like Excel Pivot Table exports with metadata rows at the top.
+    """
+    # First, get all sheet names
+    try:
+        xl = pd.ExcelFile(io.BytesIO(file_bytes))
+        sheet_names = xl.sheet_names
+    except Exception:
+        # Fallback to simple read
         return pd.read_excel(io.BytesIO(file_bytes)), 0
+    
+    best_df = None
+    best_header_row = 0
+    best_sheet_score = -1
+    
+    for sheet_name in sheet_names:
+        try:
+            # Read raw data from this sheet
+            df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=None, nrows=max_check_lines)
+        except Exception:
+            continue
+        
+        if df_raw.empty:
+            continue
+        
+        # Find best header row for this sheet
+        sheet_best_header = 0
+        sheet_best_score = 0
+        
+        for i in range(min(max_check_lines, len(df_raw))):
+            row = df_raw.iloc[i]
+            parts = [str(v).strip() for v in row.dropna().values if str(v).strip()]
+            
+            if len(parts) < 2:
+                continue
+            
+            score = 0
+            score += len(parts) * 2
+            
+            header_patterns = 0
+            for p in parts:
+                p_lower = p.lower()
+                if '[' in p and ']' in p:
+                    header_patterns += 3
+                if '_' in p or '\\' in p:
+                    header_patterns += 2
+                if '::' in p:
+                    header_patterns += 2
+                if any(kw in p_lower for kw in ['date', 'time', 'avg', 'max', 'min', 'value', 'status', 'row labels', 'tagname']):
+                    header_patterns += 2
+                if any(c.isalpha() for c in p):
+                    header_patterns += 1
+            
+            score += header_patterns
+            
+            if len(parts) <= 3:
+                score -= 10
+            
+            row_text = ' '.join(parts).lower()
+            if 'sum of' in row_text or 'column labels' in row_text or 'grand total' in row_text:
+                score -= 20
+            
+            non_numeric = sum(1 for p in parts if not str(p).replace(".", "").replace("-", "").replace(":", "").replace("/", "").replace("E", "").replace("+", "").isdigit())
+            if len(parts) > 0 and non_numeric / len(parts) >= 0.5:
+                score += 10
+            
+            if score > sheet_best_score:
+                sheet_best_score = score
+                sheet_best_header = i
+        
+        # Read the full sheet with detected header
+        try:
+            df_sheet = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=sheet_best_header)
+            df_sheet = df_sheet.dropna(how='all').reset_index(drop=True)
+            df_sheet = df_sheet.dropna(axis=1, how='all')
+            
+            # Clean column names
+            df_sheet.columns = [str(c).strip() for c in df_sheet.columns]
+            
+            # Calculate overall score for this sheet
+            # Prefer sheets with more rows and columns, and with long-format structure
+            overall_score = len(df_sheet) * len(df_sheet.columns)
+            
+            # Bonus for having columns that look like long-format data (Date, Time, Tagname, Value)
+            col_names_lower = [c.lower() for c in df_sheet.columns]
+            if any('tagname' in c or 'tag' == c for c in col_names_lower):
+                overall_score *= 2  # Strong preference for sheets with tag columns
+            if any('value' in c for c in col_names_lower):
+                overall_score *= 1.5
+            if any('date' in c for c in col_names_lower):
+                overall_score *= 1.2
+            
+            # Penalty for pivot table artifacts
+            if any('grand total' in c for c in col_names_lower):
+                overall_score *= 0.5
+            if any('row labels' in c for c in col_names_lower):
+                overall_score *= 0.7
+            
+            if overall_score > best_sheet_score:
+                best_sheet_score = overall_score
+                best_df = df_sheet
+                best_header_row = sheet_best_header
+                
+        except Exception:
+            continue
+    
+    if best_df is None:
+        # Fallback
+        return pd.read_excel(io.BytesIO(file_bytes)), 0
+    
+    # Handle Unnamed columns
+    unnamed_cols = [c for c in best_df.columns if str(c).startswith('Unnamed:')]
+    if len(unnamed_cols) > len(best_df.columns) * 0.5:
+        # Try to re-read - this might be a malformed header
+        pass  # Keep what we have
+    
+    # Remove rows where all data columns are empty
+    if len(best_df.columns) > 1:
+        best_df = best_df.dropna(subset=best_df.columns[1:], how='all').reset_index(drop=True)
+
+    return best_df, best_header_row
 
 def read_flexible_csv(file_bytes: bytes, max_check_lines: int = 50) -> tuple[pd.DataFrame, int]:
     """
@@ -904,7 +1031,7 @@ if file_data and len(file_data) > 1:
                         stacked_df, _ = create_stacked_dataframe(file_data, stack_files, overlap_handling)
                         
                         if stacked_df.empty or len(stacked_df.columns) == 0:
-                            st.error("âŒ Could not create stack: No common data columns found between the selected files.")
+                            st.error("❌ Could not create stack: No common data columns found between the selected files.")
                         else:
                             # Reset index to make datetime a regular column for storage
                             stacked_df_reset = stacked_df.reset_index()
